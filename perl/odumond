@@ -1,0 +1,745 @@
+#!/usr/bin/perl -w
+
+# LSB-compatible Init Script Settings. DO NOT REMOVE!
+### BEGIN INIT INFO
+# Provides: odumon
+# Required-Start: $remote_fs $syslog
+# Required-Stop: $remote_fs $syslog
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: ODUMon.
+# Description: Linux interfacing Perl script for Open DC UPS Monitor (ODUMon) v.1.7.
+### END INIT INFO
+
+# Open DC UPS Monitor is an Arduino-based voltage monitor for
+# unmanaged DC UPS devices powering unattended CLI Linux computers with DC-DC power supplies.
+# Dimitar D. Mitov, 2012 - 2014.
+# This file is in the public domain.
+
+# You need to be root to start this script.
+
+# This is Debian/Ubuntu LSB-compatible Init Script!
+# Install it using the following shell commands as root:
+# cp odumon /etc/init.d/odumon
+# chmod +x /etc/init.d/odumon
+# update-rc.d odumon defaults
+# Uninstall it using the following shell commands as root:
+# update-rc.d -f odumon remove
+# rm /etc/init.d/odumon
+# rm /var/run/odumon.pid
+# rm /var/log/odumon.log
+# For more information on Debian LSB Init Scripts go to:
+# http://wiki.debian.org/LSBInitScripts
+
+# DEPENDENCIES:
+# Perl Modules:
+# 1. FindBin (core module),
+# 2. POSIX (core module);
+# 3. File::Pid;
+# 4. Device::SerialPort;
+# Linux commands and programs:
+# 5. pgrep (core command),
+# 6. hal-find-by-capability (core command),
+# 7. hal-device (core command).
+
+# BASED ON THE FOLLOWING CODE, MODULES OR INSTRUCTIONS -
+# IN ORDER OF THEIR IMPLEMENTATION:
+# 1. mydaemon.pl by Andrew Ault:
+# http://www.andrewault.net/2010/05/27/creating-a-perl-daemon-in-ubuntu/
+# 2. Device::SerialPort by Kees Cook:
+# http://search.cpan.org/~cook/Device-SerialPort-1.04/SerialPort.pm
+# 3. Perl communication to Arduino over serial USB:
+# http://www.windmeadow.com/node/38
+# 4. Disabling Auto Reset On Serial Connection:
+# http://arduino.cc/playground/Main/Dis ablingAutoResetOnSerialConnection
+# 5. Perl UPS Daemon by Paul Warren:
+# http://www.ex-parrot.com/pdw/upsd/
+# 6. Determine the user and/or group running a script:
+# http://www.perlhowto.com/determine_the_user_and_or_group_running_a_script
+# 7. Format Date/Time in Perl:
+# http://www.go4expert.com/forums/showthread.php?t=15533
+# 8. How do I check whether a Perl module is installed?
+# http://stackoverflow.com/questions/802107/how-do-i-check-whether-a-perl-module-is-installed
+# 9. How To Identify A Device - Serial:
+# http://wiki.debian.org/HowToIdentifyADevice/Serial
+# 10. Perl splice Function:
+# http://www.misc-perl-info.com/perl-splice.html
+# 11. FindBin core module by Graham Barr & Nick Ing-Simmons:
+# http://search.cpan.org/~rjbs/perl-5.16.3/lib/FindBin.pm
+# http://perldoc.perl.org/FindBin.html
+# 12. Don't Open Files in the old way by Gabor Szabo:
+# http://perlmaven.com/open-files-in-the-old-way
+# 13. Cat ttyUSB:
+# http://wirespeed.xs4all.nl/mediawiki/index.php/Cat_ttyUSB
+# 14. Handling KILL signal in a perl script:
+# http://www.rhinocerus.net/forum/lang-perl-misc/70232-handling-kill-signal-perl-script.html
+
+# PAR::Packer by Steffen Mueller may be successfully used to
+# produce a compiled version of the script. Just type:
+# pp -o odumon-bin odumon
+# On Debian or Ubuntu based systems you can install PAR::Packer
+# by typing as root "apt-get install libpar-packer-perl".
+# http://steffen-mueller.net/modules/PAR-Packer/
+
+$|=1; # Disable in-built Perl buffering
+
+use strict;
+use warnings;
+# Finding the name of the script and it's working directory:
+use FindBin qw($Bin $RealScript);
+
+# CONFIGURATION SETTINGS INITILIZATIONS AND
+# THEIR DEFAULT VALUES:
+# Serial port settings:
+my $databits = 8;
+my $baudrate = 9600;
+my $parity = "none";
+my $stopbits = 1;
+# File paths:
+my $pid_file_path = "/var/run/";
+my $log_file_path = "/var/log/";
+# Logging:
+my $logging = "enabled";
+# Timings (in seconds):
+my $battery_remind_delay = 60;
+my $device_not_found_remind_delay = 60;
+my $no_data_timeout = 5;
+# Shutdown command:
+my $shutdown_command = "halt --poweroff";
+
+# MORE INITILIZATIONS:
+my $version = '1.7';
+my $die_now = 0; # used for "infinite loop" construct - allows daemon mode to gracefully exit
+my $sleep_main_loop = 1; # number of seconds to wait before "do something" execution after queue is clear
+# The following two values have to be initialized in the beginning for the messaging subroutines to work:
+my $ups_voltage;
+my $ups_remaining_usable_capacity;
+# The following value has to be initilized early for the exit routine to work properly:
+my $number_of_running_processes = 0;
+# Timers:
+my $last_device_not_found_message = 0;
+my $last_data_received = 0;
+my $last_on_battery_message = 0;
+# UPS condition variable:
+my $last_state = 0;
+# Variables for the messages and log entries:
+my $log_entry;
+my $event_date_and_time;
+
+# HEADER:
+print <<EOT;
+
+Open DC UPS Monitor, v.$version
+http://open-dc-ups-monitor.blogspot.com/
+Open DC UPS Monitor is an Arduino-based voltage monitor for
+unmanaged DC UPS devices powering computers with DC-DC power supplies.
+
+EOT
+
+# COMMAND LINE ARGUMENTS AND HELP:
+my $mode;
+if (scalar @ARGV < 1){
+    $mode = "daemon";
+    goto CHECKS;
+}
+elsif ($ARGV[0] =~ "--cli" or $ARGV[0] =~ "-C"){
+    $mode = "cli";
+    goto CHECKS;
+}
+elsif ($ARGV[0] =~ "--find-only" or $ARGV[0] =~ "-F"){
+    $mode = "find";
+    goto CHECKS;
+}
+elsif ($ARGV[0] =~ "--help" or $ARGV[0] =~ "-H"){
+    goto HELP;
+}
+
+HELP:
+if ( $< != 0 ){
+    print <<EOT;
+You have to be root to start the program!
+
+EOT
+}
+print <<EOT;
+If you start the program with no arguments,
+it will start in daemon mode:
+no output will be displayed in any terminal.
+This is necessary for the Init Script functionality.
+
+Possible command line arguments - only one of them at a time:
+
+-C,  --cli
+        start the program in command line mode and
+        see additional output in your terminal,
+        which might be helpfull in debugging
+-F,  --find-only
+        only find the serial port of an ODUMon device and exit
+-H,  --help
+        this help
+EOT
+exit;
+
+# CRITICAL CHECKS AND WARNINGS:
+CHECKS:
+my $missing_critical_dependencies_and_preconditions = 0;
+# If the user is not root, print a warning message and exit:
+if ($< != 0){
+    print <<EOT;
+You have to be root to start the program!
+
+EOT
+    $missing_critical_dependencies_and_preconditions++;
+}
+
+# If there is another running instance of the script, warn the user:
+$number_of_running_processes = `pgrep -c $RealScript`;
+chomp $number_of_running_processes;
+if ($number_of_running_processes > 1){
+    print <<EOT;
+Another instance is already running!
+
+EOT
+    $missing_critical_dependencies_and_preconditions++;
+}
+
+# If Device::SerialPort is not installed, prompt the user to install it:
+# This warning should never be displayed by the compiled version of the script.
+unless(eval{require Device::SerialPort}){
+    print <<EOT;
+Device::SerialPort Perl module is missing!
+Install it by typing:
+perl -MCPAN -e 'install Device::SerialPort'
+If you are on a Debian or Ubuntu based system,
+install it by typing as root: apt-get install libdevice-serialport-perl
+Alternatively, you can install the compiled version of this script.
+
+EOT
+    $missing_critical_dependencies_and_preconditions++;
+}
+
+# If File::Pid is not installed, prompt the user to install it:
+# This warning should never be displayed by the compiled version of the script.
+unless(eval{require File::Pid}){
+    print <<EOT;
+File::Pid Perl module is missing!
+Install it by typing:
+perl -MCPAN -e 'install File::Pid'
+If you are on a Debian or Ubuntu based system,
+install it by typing as root: apt-get install libfile-pid-perl
+Alternatively, you can install the compiled version of this script.
+
+EOT
+    $missing_critical_dependencies_and_preconditions++;
+}
+
+# If there is even one missing critical dependency or precondition, exit:
+if ($missing_critical_dependencies_and_preconditions > 0){
+    exit;
+}
+
+# NON-CRITICAL CHECKS AND WARNINGS - PART 1:
+# Find the configuration file and warn the user if none is available:
+my $config_file;
+my $number_of_configuration_variables;
+if (-e "/etc/odumon/odumon.cfg"){
+    $config_file = "/etc/odumon/odumon.cfg";
+} elsif (-e "$Bin/odumon.cfg"){
+    $config_file = "$Bin/odumon.cfg";
+} else {
+    $number_of_configuration_variables = 28;
+    print <<EOT;
+Configuration file is missing!
+Default values will be used instead of
+the missing values from the configuration file!
+To change the default values, place a valid
+'odumon.cfg' file in '/etc/odumon/' or in
+'$Bin'.
+
+EOT
+    goto FILE_VARIABLES_INITIALISATIONS;
+}
+
+# READ THE CONFIGURATION FILE:
+my $config;
+open ($config, "<", "$config_file");
+my @config_array=<$config>;
+close ($config);
+
+my $config_line;
+foreach $config_line (@config_array){
+    chomp $config_line;
+    if ($config_line !~ "#"){
+        (my $config_name, my $config_value)=split(/\=/,$config_line);
+        if ($config_line =~ "databits"){
+            $databits = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "baudrate"){
+            $baudrate = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "pid_file_path"){
+            $pid_file_path = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "log_file_path"){
+            $log_file_path = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "logging"){
+            $logging = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "battery_remind_delay"){
+            $battery_remind_delay = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "device_not_found_remind_delay"){
+            $device_not_found_remind_delay = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "no_data_timeout"){
+            $no_data_timeout = $config_value;
+            $number_of_configuration_variables++;
+        }
+        if ($config_line =~ "shutdown_command"){
+            $shutdown_command = $config_value;
+            $number_of_configuration_variables++;
+        }
+    }
+}
+
+FILE_VARIABLES_INITIALISATIONS:
+# INITIALISATIONS OF FILE VARIABLES:
+my $pid_file = $pid_file_path . "odumon.pid";
+my $log_file = $log_file_path . "odumon.log";
+
+# NON-CRITICAL CHECKS AND WARNINGS - PART 2:
+# Warn the user for a damaged or incomplete configuration file:
+if ($number_of_configuration_variables < 15){
+    print <<EOT;
+Configuration file is damaged or incomplete!
+Default values will be used instead of
+the missing values from the configuration file!
+To change the default values, place a valid
+'odumon.cfg' file in '/etc/odumon/' or in
+'$Bin'.
+
+EOT
+}
+
+# WELCOME MESSAGES:
+# Print welcome message if the user is root, there is only one instance and
+# the script is started in daemon mode:
+if ($< == 0 and $number_of_running_processes == 1 and $mode =~ "daemon"){
+    print <<EOT;
+Started in daemon mode:
+will dissociate from your terminal and create a PID file.
+
+EOT
+}
+
+# Print welcome message if the user is root, there is only one instance and
+# the script is started in command line mode:
+if ($< == 0 and $number_of_running_processes == 1 and $mode =~ "cli"){
+    print <<EOT;
+Started in command line mode:
+will print additional information in your terminal.
+You have to keep this terminal open.
+Press Ctrl-C to exit.
+
+ODUMon Serial Port Settings:
+Databits: $databits
+Baudrate: $baudrate
+Parity: $parity
+Stopbits: $stopbits
+EOT
+}
+
+# Print welcome message if the user is root, there is only one instance and
+# the script is started in exploratory mode:
+if ($< == 0 and $number_of_running_processes == 1 and $mode =~ "find"){
+    print <<EOT;
+Started in exploratory mode:
+will search for a device, eventually find one and exit.
+
+EOT
+}
+
+use POSIX;
+use File::Pid;
+use Device::SerialPort;
+
+# LOGGING AND MESSAGES:
+my $log;
+my $message;
+
+if ($logging =~ "enabled") {
+    open ($log, ">>", "$log_file");
+}
+
+# DAEMONIZE:
+if ($mode =~ "daemon"){
+    use POSIX qw (setsid);
+    chdir '/';
+    umask 0;
+    open STDIN,  '/dev/null'   or die "Open DC UPS Monitor, v.$version: Can't read /dev/null: $!";
+    open STDOUT, '>>/dev/null' or die "Open DC UPS Monitor, v.$version: Can't write to /dev/null: $!";
+    open STDERR, '>>/dev/null' or die "Open DC UPS Monitor, v.$version: Can't write to /dev/null: $!";
+    defined (my $pid = fork) or die "Open DC UPS Monitor, v.$version: Can't fork: $!";
+    exit if $pid;
+
+    # Dissociate this process from the controlling terminal that started it and stop being part
+    # of whatever process group this process was a part of.
+    POSIX::setsid() or die "Open DC UPS Monitor, v.$version: Can't start a new session.";
+
+    # Callback signal handler for signals:
+    $SIG{INT} = $SIG{TERM} = $SIG{HUP} = \&signal_handler;
+    $SIG{PIPE} = 'ignore';
+
+    # Create pid file in /var/run/
+    $pid_file = File::Pid->new( { file => $pid_file, } );
+    $pid_file->write or die "Open DC UPS Monitor, v.$version: Can't write PID file, /dev/null: $!";
+}
+
+# FIND THE SERIAL PORT OF YOUR ODUMon:
+FIND_ODUMON_PORT:
+
+signal_handler();
+
+my $odumon_serial_port = "unavailable";
+my $udi;
+my @hal_device_output;
+my $hal_device_output_line;
+my @serial_ports;
+my $serial_port;
+my $previous_serial_port_name = "unknown";
+
+my @udi = `hal-find-by-capability --capability serial`;
+foreach $udi (@udi) {
+    @hal_device_output = `hal-device $udi`;
+    foreach $hal_device_output_line (@hal_device_output) {
+        if ($hal_device_output_line =~ "device_file") {
+            (my $before_text, my $serial_port_name, my $after_text) = split (/\'/, $hal_device_output_line);
+            # Avoid duplicated serial port names and check if a device file exists:
+            if (-e $serial_port_name and $serial_port_name !~ $previous_serial_port_name) {
+                push(@serial_ports, $serial_port_name);
+                $serial_port_name = $previous_serial_port_name;
+            }
+        }
+    }
+}
+
+my $count_one;
+my $test;
+my $tested_port = "unavailable";
+my $number_of_serial_ports = scalar @serial_ports;
+
+print "\nNumber of available serial ports: $number_of_serial_ports\n";
+
+if ($number_of_serial_ports < 1) {
+    print "No serial ports found!\n";
+} else {
+    print "Available serial ports:\n";
+    foreach $serial_port (@serial_ports) {
+        print "$serial_port\n";
+        $tested_port = Device::SerialPort->new("$serial_port") or tested_serial_port_unavailable();
+        $tested_port->databits($databits);
+        $tested_port->baudrate($baudrate);
+        $tested_port->parity("$parity");
+        $tested_port->stopbits($stopbits);
+        ($count_one, $test) = $tested_port->read(30);
+        sleep(1);
+        ($count_one, $test) = $tested_port->read(30);
+        if (length($test) < 1) {
+            $test = "unknown";
+        }
+        chomp $test; # remove any newline characters.
+        $test =~ s/\s//; # trim any whitespace characters.
+        if ($test =~ "ODUMon" and $test =~ "END") {
+            $odumon_serial_port = $serial_port;
+            $tested_port->dtr_active(0); # disable reset on closing serial port
+            $tested_port->close();
+            undef $tested_port;
+        } else {
+            $tested_port->close();
+            undef $tested_port;
+        }
+    }
+}
+
+print "ODUMon serial port is: $odumon_serial_port\n";
+if ($mode =~ "find"){
+    exit;
+}
+
+# If ODUMon device is not found:
+if ($odumon_serial_port =~ "unavailable") {
+    # If script is just started and ODUMon device is not found:
+    if ($last_device_not_found_message == 0){
+        not_connected_message();
+        $last_device_not_found_message = time;
+        splice @serial_ports, 0;
+        goto FIND_ODUMON_PORT;
+    }
+    # If ODUMon device is not found,
+    # but the interval between two remind messages is still not reached:
+    if (time - $last_device_not_found_message < $device_not_found_remind_delay) {
+        # Check for an ODUMon serial port every second:
+        sleep(1);
+        # Try again to find the serial port of your ODUMon until device is found.
+        # This loop is made in case ODUMon is accidentally unpluged -
+        # the script will wait and try to find it until it is reconnected.
+        splice @serial_ports, 0;
+        goto FIND_ODUMON_PORT;
+    }
+    # If ODUMon device is not found and
+    # the interval between two remind messages is already reached:
+    if (time - $last_device_not_found_message >= $device_not_found_remind_delay){
+        not_connected_message();
+        $last_device_not_found_message = time;
+        splice @serial_ports, 0;
+        goto FIND_ODUMON_PORT;
+    }
+}
+
+# OPEN ODUMon SERIAL PORT:
+OPEN_ODUMON_PORT:
+my $port = Device::SerialPort->new("$odumon_serial_port") or odumon_port_unavailable();
+$port->databits($databits);
+$port->baudrate($baudrate);
+$port->parity("$parity");
+$port->stopbits($stopbits);
+$port->read_char_time(0); # don't wait for each character
+$port->read_const_time(10); # 0.010 seconds per unfulfilled "read" call
+
+my $count_two;
+my $data;
+
+# "INFINITE" LOOP - READING INCOMMING DATA:
+until ($die_now) {
+    sleep($sleep_main_loop);
+
+    signal_handler();
+
+    while (1) {
+
+        READ_DATA:
+        # Three methods to read data from a serial port using Device::SerialPort:
+        #$data = $port->lookfor(); # 1. method - the most CPU consuming;
+        ($count_two, $data) = $port->read(30); # 2. method - read up to 30 characters from the serial port;
+        #$data = $port->streamline(); # 3. method - read everything that comes on the serial port.
+        if (length($data) < 1) {
+            $data = "unknown";
+        } else {
+            $last_data_received = time;
+            # Date will be displayed in the following format, e.g.
+            # 26-Dec-2012|00:25:03
+            $event_date_and_time = strftime('%d-%b-%Y|%H:%M:%S', localtime);
+        }
+        $port->purge_all;
+        chomp $data; # remove any newline characters.
+        $data =~ s/\s//; # trim any whitespace characters.
+
+        # Read only complete messages from an ODUMon device.
+        if ($data =~ "ODUMon" and $data =~ "END") {
+            # UPS is ONLINE:
+            if ($data =~ "OL"){
+                (my $identifier, my $ups_status, $ups_voltage, my $end)=split(/\|/,$data);
+                # Sometimes the incomming data gets distorted;
+                # to prevent reading distorted data, the variable length is checked.
+                # Voltage is sent from ODUMon formatted like "12.58", "11.78" etc.,
+                # so variable length must be exactly 5 characters (including the decimal mark).
+                if (length($ups_voltage) != 5) {
+                    goto READ_DATA;
+                }
+                # Raise message if the last state was UNKNOWN,
+                # i.e. the script is just started:
+                if ($last_state == 0){
+                    online_message();
+                }
+                # Raise message if the last state was ON BATTERY,
+                # i.e. the ONLINE power is resumed:
+                if ($last_state == 2){
+                    online_message();
+                }
+                $last_state = 1; # ON LINE
+            }
+
+            # UPS is ON BATTERY:
+            if ($data =~ "OB") {
+                (my $identifier, my $ups_status, $ups_voltage, $ups_remaining_usable_capacity, my $end)=split(/\|/,$data);
+                # Sometimes the incomming data gets distorted;
+                # to prevent reading distorted data, the variables length are checked.
+                # Voltage and remaining usable capacity are sent from ODUMon
+                # formatted like "12.58", "11.78" etc. or "90.15", "52.16" etc.,
+                # so the length of both variables must be exactly 5 characters (including the decimal mark).
+                if (length($ups_voltage) != 5 or length($ups_remaining_usable_capacity) != 5) {
+                    goto READ_DATA;
+                }
+                # If last state was ON LINE, raise message immediately:
+                if ($last_state == 1) {
+                    on_battery_message();
+                    $last_on_battery_message = time;
+                }
+                # If last state was ON BATTERY, raise message only after
+                # the predefined delay from the previous message has elapsed:
+                if ($last_state == 2 and time - $last_on_battery_message >= $battery_remind_delay) {
+                    on_battery_message();
+                    $last_on_battery_message = time;
+                }
+                $last_state = 2; # ON BATTERY
+            }
+
+            # UPS is CRITICAL:
+            if ($data =~ "CR") {
+                $log_entry = "$event_date_and_time|POWEROFF";
+                if ($< == 0 and $number_of_running_processes == 1 and $mode =~ "cli"){
+                    print "\n$log_entry\n";
+                }
+                if ($logging =~ "enabled") {
+                    print $log "$log_entry\n";
+                }
+                # SHUTDOWN:
+                $port->dtr_active(0); # disable reset on closing serial port
+                $port->close();
+                undef $port;
+                exec ("$shutdown_command");
+                exit;
+            }
+
+        }
+
+        # Sleep 1 second after every cycle:
+        # WARNING! WARNING! THIS IS IMPORTANT SETTING!
+        # WITHOUT IT THE SCRIPT CAN EAT UP TO 90% OF
+        # YOUR CPU CYCLES ACCORDING TO HTOP!
+        # With 0.5 - 0.75 seconds "sleep" the script can eat up to 70% of the CPU cycles!
+        #sleep(1);
+
+        # Timeout for waiting without incomming data.
+        # The script will try to find again ODUMon device in case of ODUMon being accidentally disconnected.
+        # In this scenario, when the device is reconnected, it will receive from the OS a new serial port,
+        # so the script needs to find this new serial port and open it.
+        if (time - $last_data_received > $no_data_timeout) {
+            odumon_port_unavailable();
+        }
+
+    }
+
+}
+
+# SUBROUTINES:
+sub not_connected_message{
+    $event_date_and_time = strftime('%d-%b-%Y|%H:%M:%S', localtime);
+    $log_entry = "$event_date_and_time|Disconnected";
+    if ($logging =~ "enabled") {
+        print $log "$log_entry\n";
+    }
+}
+
+sub online_message{
+    $log_entry = "$event_date_and_time|OL|$ups_voltage";
+    if ($< == 0 and $number_of_running_processes == 1 and $mode =~ "cli"){
+        print "\n$log_entry\n";
+    }
+    if ($logging =~ "enabled") {
+        print $log "$log_entry\n";
+    }
+}
+
+sub on_battery_message{
+    $log_entry = "$event_date_and_time|OB|$ups_voltage|$ups_remaining_usable_capacity";
+    if ($< == 0 and $number_of_running_processes == 1 and $mode =~ "cli"){
+        print "\n$log_entry\n";
+    }
+    if ($logging =~ "enabled") {
+        print $log "$log_entry\n";
+    }
+}
+
+sub tested_serial_port_unavailable{
+    # Close tested serial port:
+    if ($tested_port !~ "unavailable"){
+        $tested_port->close();
+    }
+    undef $tested_port;
+    splice @udi, 0;
+    splice @hal_device_output, 0;
+    splice @serial_ports, 0;
+    # Try again to find the serial port of your ODUMon until device is found.
+    goto FIND_ODUMON_PORT;
+}
+
+sub odumon_port_unavailable{
+    # Close ODUMon serial port:
+    if ($odumon_serial_port !~ "unavailable"){
+        $port->close();
+    }
+    undef $port;
+    splice @udi, 0;
+    splice @hal_device_output, 0;
+    splice @serial_ports, 0;
+    # Try again to find the serial port of your ODUMon until device is found.
+    # This loop is made in case ODUMon is accidentally unpluged -
+    # the script will wait and try to find it until it is reconnected.
+    goto FIND_ODUMON_PORT;
+}
+
+# Catch signals and end the program if one is caught:
+sub signal_handler {
+    $die_now = 1; # this will cause the "infinite loop" to exit
+}
+
+sub signal_handler{
+    # TRAP PROCESS ENDING SIGNALS:
+    # When SIGHUP is received, exit gracefully:
+    $SIG{HUP} = sub {
+        print "\n\nOpen DC UPS Monitor, v.$version: SIGHUP received, quitting.\n\n";
+        exit;
+    };
+    # When a SIGINT is received (Ctrl-C was pressed), exit gracefully:
+    $SIG{INT} = sub {
+        print "\n\nOpen DC UPS Monitor, v.$version: SIGINT received, quitting.\n";
+        print "Most probably Ctrl-C was pressed.\n\n";
+        exit;
+    };
+    # When SIGQUIT is received, exit gracefully:
+    $SIG{QUIT} = sub {
+        print "\n\nOpen DC UPS Monitor, v.$version: SIGQUIT received, quitting.\n\n";
+        exit;
+    };
+    # When SIGTERM is received, exit gracefully:
+    $SIG{TERM} = sub {
+        print "\n\nOpen DC UPS Monitor, v.$version: SIGTERM received, quitting.\n\n";
+        exit;
+    };
+}
+
+# Do this stuff when exit() is called:
+END {
+    # Close the log file:
+    if (length($log) > 0) {
+        close $log;
+    }
+    # Close the message file:
+    if (length($message) > 0) {
+        close $message;
+        unlink $message_file;
+    }
+    # The PID file will be removed only if all of the following conditions are met:
+    # 1. the script is started with root privileges;
+    # 2. there is only one running instance;
+    # 3. the script is started in daemon mode;
+    # 4. there is a PID file.
+    # This routine avoids unwanted error messages for the user or
+    # removing the PID file of a running instance of the script.
+    if ($< == 0 and $number_of_running_processes == 1 and $mode =~ "daemon"){
+        if (-e $pid_file) {
+            $pid_file->remove;
+        }
+    }
+}
+
+__END__
